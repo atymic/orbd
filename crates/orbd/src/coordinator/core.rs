@@ -704,15 +704,16 @@ impl Core {
             plan.tombstone = Some((head.amp_endpoint.to_string(), head.amp_orb_id.to_string()));
         }
 
-        let Some(backend) = self.backends.get(&offering.backend_id).cloned() else {
-            return Ok(Err(refuse(
-                FailureCode::BackendUnavailable,
-                "backend not configured",
-            )));
-        };
-
         match orb {
             Some(orb) => {
+                // An existing orb lives on its own backend, which differs from the
+                // offering's when the orb was spilled.
+                let Some(backend) = self.backends.get(orb.location.backend_id()).cloned() else {
+                    return Ok(Err(refuse(
+                        FailureCode::BackendUnavailable,
+                        "backend not configured",
+                    )));
+                };
                 // Existing orb: never re-place.
                 let template = &orb.spec.template;
                 let cands = self
@@ -791,78 +792,40 @@ impl Core {
                 let snap_key = snapshot_id
                     .as_deref()
                     .map(ProjectSnapshotKey::from_external);
-                let cands = self
-                    .candidates(
-                        &backend,
-                        PlacementRequest {
-                            target: offering.spec.target.clone(),
-                            resources: offering.spec.resources,
-                            existing: None,
-                            project_snapshot: snap_key.clone(),
-                        },
-                    )
-                    .await;
-                let available: Vec<PlacementCandidate> = cands
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|c| {
-                        c.availability == Availability::Available
-                            && c.capabilities.check(&offering.spec).is_empty()
-                    })
-                    .collect();
-                if available.is_empty() {
-                    return Ok(Err(refuse(
-                        FailureCode::BackendUnavailable,
-                        "no available host can run this offering",
-                    )));
-                }
-                let demand = self.demand(&offering.spec);
-                let mut fitting: Vec<(PlacementCandidate, u64)> = Vec::new();
-                let mut refusals: Vec<(String, Vec<(FailureCode, String)>)> = Vec::new();
-                for cand in available {
-                    let used = self.pool_used(&cand, None).await?;
-                    let short = shortfalls(&cand, &used, demand);
-                    if short.is_empty() {
-                        let free = cand
-                            .capacity_ceiling
-                            .memory_bytes
-                            .saturating_sub(used.held.memory_bytes);
-                        fitting.push((cand, free));
-                    } else {
-                        refusals.push((cand.capacity_pool.clone(), short));
+                // The offering's own hosts first, then its spill_to offerings in order.
+                let mut placed = self.place_new(offering, snap_key.as_ref()).await?;
+                if let Err(first) = &placed {
+                    let mut tried = Vec::new();
+                    for id in &offering.spill_to {
+                        let Some(target) = self.offerings.get(id).cloned() else {
+                            continue;
+                        };
+                        match self.place_new(&target, snap_key.as_ref()).await? {
+                            Ok(p) => {
+                                tracing::info!(
+                                    offering = %offering.id,
+                                    spill_to = %target.id,
+                                    amp_orb_id = %head.amp_orb_id,
+                                    reason = %first.message,
+                                    "spilling a new orb"
+                                );
+                                metrics::counter!("orbd_spills_total", "offering" => offering.id.to_string(), "to" => target.id.to_string()).increment(1);
+                                placed = Ok(p);
+                                break;
+                            }
+                            Err(r) => tried.push(format!("{}: {}", target.id, r.message)),
+                        }
+                    }
+                    if let Err(first) = &mut placed
+                        && !tried.is_empty()
+                    {
+                        first.message = format!("{}; spill: {}", first.message, tried.join("; "));
                     }
                 }
-                if fitting.is_empty() {
-                    let hosts: Vec<String> = refusals
-                        .iter()
-                        .map(|(pool, short)| format!("{pool}: {}", describe(short)))
-                        .collect();
-                    return Ok(Err(refuse(
-                        limiting(&refusals),
-                        format!(
-                            "no host has capacity for this orb ({} vCPUs, {} memory, {} disk \
-                             headroom); {}",
-                            demand.vcpus,
-                            gib(demand.memory_bytes),
-                            gib(demand.disk_bytes),
-                            hosts.join("; ")
-                        ),
-                    )));
-                }
-                // Prefer a host holding the project snapshot (v1: snapshots are
-                // host-local); otherwise fall back to the base image for this new orb.
-                if snap_key.is_some() && fitting.iter().any(|(c, _)| c.has_project_snapshot) {
-                    fitting.retain(|(c, _)| c.has_project_snapshot);
-                }
-                let (chosen, _) = fitting
-                    .into_iter()
-                    .max_by(|(a, fa), (b, fb)| {
-                        fa.cmp(fb).then_with(|| {
-                            let (ja, jb) = (js(&a.location), js(&b.location));
-                            jb.cmp(&ja)
-                        })
-                    })
-                    .expect("non-empty");
+                let (chosen, demand, template) = match placed {
+                    Ok(p) => p,
+                    Err(r) => return Ok(Err(r)),
+                };
                 let initial_disk = match &snap_key {
                     Some(k) if chosen.has_project_snapshot => InitialDiskSource::ProjectSnapshot {
                         snapshot: ProjectSnapshotRef { key: k.clone() },
@@ -873,7 +836,7 @@ impl Core {
                     },
                 };
                 let spec = OrbSpec {
-                    template: offering.spec.clone(),
+                    template,
                     initial_disk,
                 };
                 let spec_digest = spec.digest();
@@ -915,6 +878,94 @@ impl Core {
                 Ok(Ok(plan))
             }
         }
+    }
+
+    /// Places a new orb of `offering` on one of its backend's hosts: the chosen
+    /// candidate, what the orb reserves there, and the spec template it runs with.
+    async fn place_new(
+        &self,
+        offering: &Offering,
+        snap_key: Option<&ProjectSnapshotKey>,
+    ) -> Result<std::result::Result<(PlacementCandidate, Resources, SpecTemplate), Refusal>> {
+        let Some(backend) = self.backends.get(&offering.backend_id).cloned() else {
+            return Ok(Err(refuse(
+                FailureCode::BackendUnavailable,
+                "backend not configured",
+            )));
+        };
+        let cands = self
+            .candidates(
+                &backend,
+                PlacementRequest {
+                    target: offering.spec.target.clone(),
+                    resources: offering.spec.resources,
+                    existing: None,
+                    project_snapshot: snap_key.cloned(),
+                },
+            )
+            .await;
+        let available: Vec<PlacementCandidate> = cands
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|c| {
+                c.availability == Availability::Available
+                    && c.capabilities.check(&offering.spec).is_empty()
+            })
+            .collect();
+        if available.is_empty() {
+            return Ok(Err(refuse(
+                FailureCode::BackendUnavailable,
+                "no available host can run this offering",
+            )));
+        }
+        let demand = self.demand(&offering.spec);
+        let mut fitting: Vec<(PlacementCandidate, u64)> = Vec::new();
+        let mut refusals: Vec<(String, Vec<(FailureCode, String)>)> = Vec::new();
+        for cand in available {
+            let used = self.pool_used(&cand, None).await?;
+            let short = shortfalls(&cand, &used, demand);
+            if short.is_empty() {
+                let free = cand
+                    .capacity_ceiling
+                    .memory_bytes
+                    .saturating_sub(used.held.memory_bytes);
+                fitting.push((cand, free));
+            } else {
+                refusals.push((cand.capacity_pool.clone(), short));
+            }
+        }
+        if fitting.is_empty() {
+            let hosts: Vec<String> = refusals
+                .iter()
+                .map(|(pool, short)| format!("{pool}: {}", describe(short)))
+                .collect();
+            return Ok(Err(refuse(
+                limiting(&refusals),
+                format!(
+                    "no host has capacity for this orb ({} vCPUs, {} memory, {} disk \
+                             headroom); {}",
+                    demand.vcpus,
+                    gib(demand.memory_bytes),
+                    gib(demand.disk_bytes),
+                    hosts.join("; ")
+                ),
+            )));
+        }
+        // Prefer a host holding the project snapshot (v1: snapshots are
+        // host-local); otherwise fall back to the base image for this new orb.
+        if snap_key.is_some() && fitting.iter().any(|(c, _)| c.has_project_snapshot) {
+            fitting.retain(|(c, _)| c.has_project_snapshot);
+        }
+        let (chosen, _) = fitting
+            .into_iter()
+            .max_by(|(a, fa), (b, fb)| {
+                fa.cmp(fb).then_with(|| {
+                    let (ja, jb) = (js(&a.location), js(&b.location));
+                    jb.cmp(&ja)
+                })
+            })
+            .expect("non-empty");
+        Ok(Ok((chosen, demand, offering.spec.clone())))
     }
 
     /// Re-seals a queued request's guest env under the new operation id.
@@ -1635,7 +1686,8 @@ fn gib(bytes: u64) -> String {
 }
 
 /// Every resource `cand` lacks for `demand` after the reservations in `used`, with the
-/// numbers. Disk is judged by what the host reports, not by orb disk sizes (sparse): the
+/// numbers. Memory must also fit what the host really has available, less its reserve:
+/// a host's capacity may overcommit memory, and its agent rechecks this at admission. Disk is judged by what the host reports, not by orb disk sizes (sparse): the
 /// filesystem's free space less its reserve, and the agent's disk limit less what orbd
 /// has allocated, must each still hold the headroom of every running orb plus this one.
 fn shortfalls(
@@ -1658,6 +1710,21 @@ fn shortfalls(
                 gib(cap.memory_bytes)
             ),
         ));
+    }
+    if let Some(m) = cand.memory {
+        let room = m.available_bytes.saturating_sub(m.reserve_bytes);
+        if demand.memory_bytes > room && demand.memory_bytes <= free_mem {
+            out.push((
+                FailureCode::InsufficientMemory,
+                format!(
+                    "memory: needs {}, {} usable on the host ({} available, {} reserve)",
+                    gib(demand.memory_bytes),
+                    gib(room),
+                    gib(m.available_bytes),
+                    gib(m.reserve_bytes)
+                ),
+            ));
+        }
     }
     let free_cpu = cap.vcpus.saturating_sub(held.vcpus);
     if demand.vcpus > free_cpu {
@@ -1766,4 +1833,62 @@ fn command_digest(plan: &CreatePlan, spec_digest: &SpecDigest) -> String {
     ))
     .expect("serializable");
     hex::encode(Sha256::digest(body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{AgentId, BackendId, DiskReport, MemoryReport, RuntimeKind};
+
+    #[test]
+    fn memory_fits_overcommitted_capacity_only_while_the_host_has_it() {
+        let cand = |available_gib: u64| PlacementCandidate {
+            location: Location::Fleet {
+                backend_id: BackendId::new("fleet"),
+                agent_id: AgentId::new("n100".to_owned()),
+            },
+            availability: Availability::Available,
+            capabilities: crate::backend::fleet::capabilities::ceiling(RuntimeKind::Qemu),
+            capacity_pool: "n100".into(),
+            capacity_ceiling: Resources {
+                vcpus: 80,
+                memory_bytes: 88 * GIB,
+                disk_bytes: 1000 * GIB,
+            },
+            demand: Resources::default(),
+            disk: Some(DiskReport {
+                free_bytes: 900 * GIB,
+                total_bytes: 1800 * GIB,
+                allocated_bytes: 100 * GIB,
+                reserve_bytes: 90 * GIB,
+            }),
+            memory: Some(MemoryReport {
+                available_bytes: available_gib * GIB,
+                reserve_bytes: 8 * GIB,
+            }),
+            has_project_snapshot: false,
+        };
+        // Three running orbs reserve 34 GiB and 17 vCPUs nominally, as on 2026-10-30.
+        let used = store::PoolUse {
+            held: Resources {
+                vcpus: 17,
+                memory_bytes: 34 * GIB,
+                disk_bytes: 30 * GIB,
+            },
+            running: 3,
+            orbs: 18,
+        };
+        let demand = Resources {
+            vcpus: 8,
+            memory_bytes: 16 * GIB,
+            disk_bytes: 10 * GIB,
+        };
+        // 34 GiB available - 8 GiB reserve = 26 GiB: a 16 GiB orb fits.
+        assert!(shortfalls(&cand(34), &used, demand).is_empty());
+        // 23 GiB - 8 GiB = 15 GiB: it does not, although capacity has room.
+        let short = shortfalls(&cand(23), &used, demand);
+        assert_eq!(short.len(), 1, "{short:?}");
+        assert_eq!(short[0].0, FailureCode::InsufficientMemory);
+        assert!(short[0].1.contains("usable on the host"), "{}", short[0].1);
+    }
 }
