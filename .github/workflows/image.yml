@@ -45,6 +45,7 @@ jobs:
           case "$GITHUB_REF" in
             refs/tags/v*) tags="$IMAGE:$GITHUB_REF_NAME,$IMAGE:latest" ;;
             refs/heads/main) tags="$IMAGE:main,$IMAGE:sha-${GITHUB_SHA::7}" ;;
+            refs/heads/deploy) tags="$IMAGE:deploy,$IMAGE:sha-${GITHUB_SHA::7}" ;;
             *) tags= ;;
           esac
           echo "tags=$tags" >>"$GITHUB_OUTPUT"
