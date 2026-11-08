@@ -167,6 +167,27 @@ placed, so an orb placed on Boat wakes there for the rest of its life. Resumes n
 move. (In v1, an offering's `spill_to` lists like-for-like offerings to the same
 effect.)
 
+An agent's host can be off while no orb runs on it, e.g. an autoscaling group scaled
+to zero, with the coordinator on a small always-on machine. `wake:` gives the commands
+that start and stop it (argv, run one at a time):
+
+```yaml
+wake:
+  command: [aws, autoscaling, set-desired-capacity, --auto-scaling-group-name, orbs, --desired-capacity, "1"]
+  timeout_secs: 180              # default; at most 200
+  sleep_command: [aws, autoscaling, set-desired-capacity, --auto-scaling-group-name, orbs, --desired-capacity, "0"]
+  sleep_after_idle_secs: 7200
+```
+
+A spawn on the agents that finds no agent available runs `command` and waits up to
+`timeout_secs` for one to connect, then fails as before. Once no orb has run or had a
+job on the agents for `sleep_after_idle_secs`, `sleep_command` runs; sleeping orbs do
+not count, since they keep their disk and checkpoint. A spawn that arrives while
+`sleep_command` runs waits for it, then wakes the host again. Have `sleep_command`
+return only once the host is down (e.g. wrap it in a script that ends with `aws ec2
+wait instance-terminated`), or a spawn just after it can land on a host that is
+shutting down.
+
 The coordinator keeps the Amp CLI current with `amp update` (every
 `amp_cli_update_interval_secs`, 6 h by default) and puts each new version on probation.
 The first spawn it runs that succeeds makes it the known-good CLI, kept as a copy in
