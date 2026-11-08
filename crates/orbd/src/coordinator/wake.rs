@@ -214,7 +214,11 @@ async fn run(hook: Hook, argv: &[String]) -> Result<(), String> {
                     tracing::info!(hook = hook.name(), stdout = %tail(&out.stdout), "hook command finished");
                     Ok(())
                 }
-                Ok(Ok(out)) => Err(format!("{}: {}", out.status, tail(&out.stderr))),
+                // Only the status reaches the job's message; stderr stays in the log.
+                Ok(Ok(out)) => {
+                    tracing::warn!(hook = hook.name(), stderr = %tail(&out.stderr), "hook command stderr");
+                    Err(out.status.to_string())
+                }
             }
         }
     };
