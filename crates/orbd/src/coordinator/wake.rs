@@ -1,14 +1,13 @@
-//! `wake:` hooks. Commands run one at a time, in order, so a wake asked for while the
-//! sleep command runs starts the host again after it.
+//! `wake:` hooks. Commands run one at a time. After the sleep command, spawns wait for
+//! the agents to disconnect before waking them, so a non-blocking sleep command is safe.
 
 use super::core::Msg;
 use crate::config::coordinator::WakeConfig;
 use crate::model::InvocationId;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-const HOOK_TIMEOUT: Duration = Duration::from_secs(120);
 const WAKE_RETRY: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,23 +40,28 @@ pub struct Waker {
     wake_error: Option<String>,
     /// When the sleep command was started, while it runs.
     sleeping_since: Option<Instant>,
+    /// When the sleep command finished, while agents it should stop are still connected.
+    draining_since: Option<Instant>,
+    connected: HashSet<String>,
     /// The sleep command ran and nothing has woken the agents since.
     slept: bool,
     idle_since: Option<Instant>,
-    waiting: HashMap<InvocationId, Instant>,
+    /// Held spawns: since when, and whether the wake note was sent.
+    waiting: HashMap<InvocationId, (Instant, bool)>,
 }
 
 impl Waker {
     pub fn start(cfg: WakeConfig, core: mpsc::Sender<Msg>) -> Self {
         let (runs, mut rx) = mpsc::unbounded_channel::<Hook>();
         let (wake, sleep) = (cfg.command.clone(), cfg.sleep_command.clone());
+        let hook_timeout = Duration::from_secs(cfg.hook_timeout_secs);
         tokio::spawn(async move {
             while let Some(hook) = rx.recv().await {
                 let argv = match hook {
                     Hook::Wake => &wake,
                     Hook::Sleep => sleep.as_ref().expect("sleep only runs when configured"),
                 };
-                let result = run(hook, argv).await;
+                let result = run(hook, argv, hook_timeout).await;
                 if core.send(Msg::HookFinished { hook, result }).await.is_err() {
                     break;
                 }
@@ -73,6 +77,8 @@ impl Waker {
             woke_at: None,
             wake_error: None,
             sleeping_since: None,
+            draining_since: None,
+            connected: HashSet::new(),
             slept: false,
             idle_since: None,
             waiting: HashMap::new(),
@@ -89,9 +95,14 @@ impl Waker {
         let _ = self.runs.send(Hook::Wake);
     }
 
+    fn draining(&self) -> bool {
+        self.draining_since
+            .is_some_and(|t| t.elapsed() < self.timeout)
+    }
+
     /// Whether a spawn arriving now must wait even if an agent looks available.
-    pub fn sleeping(&self) -> bool {
-        self.sleeping_since.is_some()
+    pub fn holding(&self) -> bool {
+        self.sleeping_since.is_some() || self.draining()
     }
 
     /// `unavailable`: placement found no host. The note is for the job's log.
@@ -99,12 +110,13 @@ impl Waker {
         if self
             .waiting
             .get(&inv)
-            .is_some_and(|t| t.elapsed() >= self.timeout)
+            .is_some_and(|(t, _)| t.elapsed() >= self.timeout)
         {
-            self.waiting.remove(&inv);
+            // Kept until the spawn is placed or given up, so its wait is not restarted.
             if !unavailable {
                 return (Hold::No, None);
             }
+            self.waiting.remove(&inv);
             let mut why = format!(
                 "no agent connected within {}s of the wake command",
                 self.timeout.as_secs()
@@ -114,24 +126,32 @@ impl Waker {
             }
             return (Hold::GiveUp(why), None);
         }
+        if self.holding() {
+            let mut note = None;
+            self.waiting.entry(inv).or_insert_with(|| {
+                note = Some(
+                    "waiting for the agents' hosts to go to sleep before waking them".to_owned(),
+                );
+                (Instant::now(), false)
+            });
+            return (Hold::Wait, note);
+        }
+        if !unavailable {
+            return (Hold::No, None);
+        }
         let stale = self.woke_at.is_none_or(|t| {
             t.elapsed() >= self.timeout || (self.wake_error.is_some() && t.elapsed() >= WAKE_RETRY)
         });
-        let woken_since_sleep = match (self.sleeping_since, self.woke_at) {
-            (Some(s), Some(w)) => w >= s,
-            (Some(_), None) => false,
-            (None, _) => true,
-        };
-        if (unavailable && stale) || !woken_since_sleep {
+        if stale {
             self.wake();
         }
-        if !unavailable && !self.sleeping() {
-            return (Hold::No, None);
-        }
-        let mut note = None;
-        self.waiting.entry(inv).or_insert_with(|| {
-            note = Some("waiting for an agent to connect after the wake command".to_owned());
-            Instant::now()
+        let entry = self
+            .waiting
+            .entry(inv)
+            .or_insert_with(|| (Instant::now(), false));
+        let note = (!entry.1).then(|| {
+            entry.1 = true;
+            "waiting for an agent to connect after the wake command".to_owned()
         });
         (Hold::Wait, note)
     }
@@ -140,21 +160,33 @@ impl Waker {
         self.waiting.remove(&inv);
     }
 
-    pub fn agent_connected(&mut self) {
+    pub fn agent_connected(&mut self, agent: String) {
+        self.connected.insert(agent);
         self.slept = false;
         self.idle_since = None;
+    }
+
+    pub fn agent_disconnected(&mut self, agent: &str) {
+        self.connected.remove(agent);
+        if self.connected.is_empty() {
+            self.draining_since = None;
+        }
     }
 
     pub fn finished(&mut self, hook: Hook, result: Result<(), String>) {
         match (hook, result) {
             (Hook::Wake, Err(e)) => self.wake_error = Some(e),
             (Hook::Wake, Ok(())) => {}
-            (Hook::Sleep, r) => {
+            (Hook::Sleep, Ok(())) => {
+                self.sleeping_since = None;
+                if !self.connected.is_empty() {
+                    self.draining_since = Some(Instant::now());
+                }
+            }
+            (Hook::Sleep, Err(_)) => {
                 self.sleeping_since = None;
                 // The host may still be up: count idle time again before the next try.
-                if r.is_err() {
-                    self.slept = false;
-                }
+                self.slept = false;
             }
         }
     }
@@ -162,12 +194,13 @@ impl Waker {
     pub fn tick(&mut self, busy: bool) {
         let now = Instant::now();
         let keep = self.timeout + Duration::from_secs(60);
-        self.waiting.retain(|_, t| now.duration_since(*t) < keep);
+        self.waiting
+            .retain(|_, (t, _)| now.duration_since(*t) < keep);
         let Some(after) = self.sleep_after else {
             return;
         };
         let waking = self.woke_at.is_some_and(|t| t.elapsed() < self.timeout);
-        if busy || waking || self.slept || self.sleeping() || !self.waiting.is_empty() {
+        if busy || waking || self.slept || self.holding() || !self.waiting.is_empty() {
             self.idle_since = None;
             return;
         }
@@ -187,7 +220,7 @@ impl Waker {
 }
 
 /// Runs the command in its own process group, so a timeout also kills what it started.
-async fn run(hook: Hook, argv: &[String]) -> Result<(), String> {
+async fn run(hook: Hook, argv: &[String], timeout: Duration) -> Result<(), String> {
     let mut cmd = tokio::process::Command::new(&argv[0]);
     cmd.args(&argv[1..])
         .stdin(std::process::Stdio::null())
@@ -199,7 +232,7 @@ async fn run(hook: Hook, argv: &[String]) -> Result<(), String> {
         Err(e) => Err(format!("{}: {e}", argv[0])),
         Ok(child) => {
             let pid = child.id();
-            match tokio::time::timeout(HOOK_TIMEOUT, child.wait_with_output()).await {
+            match tokio::time::timeout(timeout, child.wait_with_output()).await {
                 Err(_) => {
                     if let Some(pid) = pid {
                         let _ = nix::sys::signal::killpg(
@@ -207,7 +240,7 @@ async fn run(hook: Hook, argv: &[String]) -> Result<(), String> {
                             nix::sys::signal::Signal::SIGKILL,
                         );
                     }
-                    Err(format!("timed out after {}s", HOOK_TIMEOUT.as_secs()))
+                    Err(format!("timed out after {}s", timeout.as_secs()))
                 }
                 Ok(Err(e)) => Err(format!("{}: {e}", argv[0])),
                 Ok(Ok(out)) if out.status.success() => {

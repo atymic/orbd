@@ -198,6 +198,13 @@ pub struct WakeConfig {
     pub sleep_command: Option<Vec<String>>,
     #[serde(default)]
     pub sleep_after_idle_secs: u64,
+    /// Either command is killed after this long.
+    #[serde(default = "default_hook_timeout")]
+    pub hook_timeout_secs: u64,
+}
+
+fn default_hook_timeout() -> u64 {
+    120
 }
 
 fn default_wake_timeout() -> u64 {
@@ -548,6 +555,9 @@ impl CoordinatorConfig {
                     "wake.timeout_secs must be between 1 and {MAX_WAKE_TIMEOUT_SECS}"
                 ));
             }
+            if !(1..=3600).contains(&w.hook_timeout_secs) {
+                return inv("wake.hook_timeout_secs must be between 1 and 3600".into());
+            }
             match (&w.sleep_command, w.sleep_after_idle_secs) {
                 (Some(c), _) if c.is_empty() => {
                     return inv("wake.sleep_command is empty".into());
@@ -796,6 +806,10 @@ mod tests {
             assert!(e.contains(want), "{e}");
         };
         err("  command: []\n", "wake.command is empty");
+        err(
+            "  command: [start-host]\n  hook_timeout_secs: 0\n",
+            "hook_timeout_secs must be between 1 and 3600",
+        );
         err(
             "  command: [start-host]\n  timeout_secs: 0\n",
             "between 1 and 200",

@@ -634,9 +634,9 @@ impl Core {
         let spawn = matches!(head.action, ReqAction::Spawn { .. });
         let wakes =
             spawn && self.waker.is_some() && self.on_fleet(orb.as_ref(), offering.as_ref(), true);
-        // While the sleep command runs, the agent may still look available.
+        // During and after the sleep command, the agent may still look available.
         if spawn
-            && self.waker.as_ref().is_some_and(|w| w.sleeping())
+            && self.waker.as_ref().is_some_and(|w| w.holding())
             && self.on_fleet(orb.as_ref(), offering.as_ref(), false)
             && let Some(step) = self.hold(head, orb.as_ref(), None).await?
         {
@@ -1373,11 +1373,12 @@ impl Core {
                 availability,
             } => {
                 tracing::info!(?location, ?availability, "backend availability changed");
-                if availability == Availability::Available
-                    && matches!(location, Location::Fleet { .. })
-                    && let Some(w) = &mut self.waker
-                {
-                    w.agent_connected();
+                if let (Location::Fleet { agent_id, .. }, Some(w)) = (&location, &mut self.waker) {
+                    if availability == Availability::Available {
+                        w.agent_connected(agent_id.to_string());
+                    } else {
+                        w.agent_disconnected(&agent_id.to_string());
+                    }
                 }
                 if availability == Availability::Available {
                     let open = self.db.call(|c| store::open_commands(c)).await?;
